@@ -260,13 +260,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load file:\n{e}")
 
-    def _save_file(self) -> None:
-        """Save the modified file."""
-        if not self._file_loaded:
-            QMessageBox.warning(self, "Warning", "No file loaded to save.")
-            return
-
-        # Pre-save safety validation
+    def _pre_save_validation(self) -> bool:
+        """Run pre-save safety validation and confirmation dialog.
+        Returns True if save should proceed, False otherwise.
+        """
         self.validator.clear()
         self.validator.validate_file_size(
             len(self.reader.original_data), len(self.reader.data)
@@ -279,7 +276,7 @@ class MainWindow(QMainWindow):
                 + "\n".join(report["errors"])
                 + "\n\nUse 'Reset' to restore the original file."
             )
-            return
+            return False
 
         changes = self.reader.get_changes()
         reply = QMessageBox.question(
@@ -289,7 +286,15 @@ class MainWindow(QMainWindow):
             f"Modified size: {len(self.reader.data):,} bytes",
             QMessageBox.Yes | QMessageBox.No,
         )
-        if reply == QMessageBox.No:
+        return reply == QMessageBox.Yes
+
+    def _save_file(self) -> None:
+        """Save the modified file."""
+        if not self._file_loaded:
+            QMessageBox.warning(self, "Warning", "No file loaded to save.")
+            return
+
+        if not self._pre_save_validation():
             return
 
         try:
@@ -306,6 +311,9 @@ class MainWindow(QMainWindow):
         """Save the modified file with a custom path."""
         if not self._file_loaded:
             QMessageBox.warning(self, "Warning", "No file loaded to save.")
+            return
+
+        if not self._pre_save_validation():
             return
 
         file_path, _ = QFileDialog.getSaveFileName(
