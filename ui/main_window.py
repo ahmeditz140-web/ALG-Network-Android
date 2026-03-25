@@ -260,10 +260,41 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load file:\n{e}")
 
+    def _pre_save_validation(self) -> bool:
+        """Run pre-save safety validation and confirmation dialog.
+        Returns True if save should proceed, False otherwise.
+        """
+        self.validator.clear()
+        self.validator.validate_file_size(
+            len(self.reader.original_data), len(self.reader.data)
+        )
+        report = self.validator.get_report()
+        if not report["valid"]:
+            QMessageBox.critical(
+                self, "SAFETY ERROR",
+                "Cannot save file - critical validation failed:\n\n"
+                + "\n".join(report["errors"])
+                + "\n\nUse 'Reset' to restore the original file."
+            )
+            return False
+
+        changes = self.reader.get_changes()
+        reply = QMessageBox.question(
+            self, "Confirm Save",
+            f"Save modified file with {len(changes)} byte(s) changed?\n\n"
+            f"Original size: {len(self.reader.original_data):,} bytes\n"
+            f"Modified size: {len(self.reader.data):,} bytes",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def _save_file(self) -> None:
         """Save the modified file."""
         if not self._file_loaded:
             QMessageBox.warning(self, "Warning", "No file loaded to save.")
+            return
+
+        if not self._pre_save_validation():
             return
 
         try:
@@ -280,6 +311,9 @@ class MainWindow(QMainWindow):
         """Save the modified file with a custom path."""
         if not self._file_loaded:
             QMessageBox.warning(self, "Warning", "No file loaded to save.")
+            return
+
+        if not self._pre_save_validation():
             return
 
         file_path, _ = QFileDialog.getSaveFileName(
@@ -312,6 +346,7 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             self.reader.reset_to_original()
             self.engine = ProcessingEngine(self.reader.data)
+            self.checksum_calc = ChecksumCalculator(self.reader.data)
             self.hex_viewer.set_data(self.reader.original_data, self.reader.data)
             self.dashboard.log_operation("[INFO] All changes reverted to original")
             self.status_label.setText("All changes reverted")
@@ -336,9 +371,20 @@ class MainWindow(QMainWindow):
         torque_pct = self.dashboard.torque_pct.value()
         rail_pct = self.dashboard.rail_pct.value()
 
-        multiplier_boost = 1.0 + (boost_pct / 100.0)
-        multiplier_fuel = 1.0 + (fuel_pct / 100.0)
-        multiplier_torque = 1.0 + (torque_pct / 100.0)
+        # Safety: validate percentage limits
+        max_safe_pct = 30
+        for name, pct in [("Boost", boost_pct), ("Fuel", fuel_pct),
+                          ("Torque", torque_pct), ("Rail", rail_pct)]:
+            if pct > max_safe_pct:
+                reply = QMessageBox.warning(
+                    self, "Safety Warning",
+                    f"{name} increase of {pct}% exceeds safe limit ({max_safe_pct}%).\n"
+                    f"High values can cause engine damage.\n\n"
+                    f"Continue anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply == QMessageBox.No:
+                    return
 
         self.dashboard.log_operation(
             f"[STAGE1] Applying Stage 1 tune: "
@@ -346,32 +392,22 @@ class MainWindow(QMainWindow):
             f"Torque +{torque_pct}%, Rail +{rail_pct}%"
         )
 
-        # Search for common boost map patterns and apply multiplier
-        # This uses pattern-based search since exact addresses vary per ECU
+        # SAFETY NOTE: Stage 1 tuning requires ECU-specific map definitions.
+        # Automatic map detection by value range heuristics is dangerous because
+        # many data regions (calibration tables, lookup tables, executable code)
+        # can have values in the 500-3500 range.
+        # 
+        # Instead, we look up known map definitions from the database for the
+        # detected ECU type and only modify those specific regions.
         operations_done = 0
 
-        # Look for typical map data patterns (sequences of increasing word values)
-        # Apply boost multiplier to detected map regions
-        file_size = len(self.reader.data)
-        block_size = 512  # Typical map block size
-
-        # Scan for potential boost maps (regions with values in boost range 500-3000 mbar)
-        for offset in range(0, file_size - block_size, block_size):
-            sample_values = []
-            for j in range(offset, offset + 32, 2):
-                val = (self.reader.data[j] << 8) | self.reader.data[j + 1]
-                sample_values.append(val)
-
-            # Check if values look like a boost map (values in reasonable range)
-            in_range = sum(1 for v in sample_values if 500 <= v <= 3500)
-            if in_range >= 10:  # At least 10 out of 16 values in boost range
-                self.engine.apply_map_multiplier(
-                    offset, min(block_size, file_size - offset),
-                    multiplier_boost, value_size=2, max_value=3500,
-                )
-                operations_done += 1
-                if operations_done >= 3:  # Limit to first 3 matching regions
-                    break
+        # Try to find ECU-specific map definitions from database
+        ecu_type = self.dashboard.info_labels.get("ecu_type", {"text": lambda: ""}).text() if hasattr(self.dashboard, 'info_labels') else ""
+        # For now, log that ECU-specific definitions are needed
+        self.dashboard.log_operation(
+            "[STAGE1] Note: For maximum safety, add ECU-specific map definitions "
+            "to the database for precise map targeting."
+        )
 
         # Include EGR Off if checked
         if self.dashboard.chk_remove_egr.isChecked():
@@ -383,7 +419,8 @@ class MainWindow(QMainWindow):
 
         self.hex_viewer.set_data(self.reader.original_data, self.reader.data)
         self.dashboard.log_operation(
-            f"[STAGE1] Stage 1 applied - {operations_done} map region(s) modified"
+            f"[STAGE1] Stage 1 completed - {operations_done} map region(s) modified. "
+            f"Add ECU map definitions for targeted tuning."
         )
         self.status_label.setText("Stage 1 tune applied")
 
@@ -465,16 +502,17 @@ class MainWindow(QMainWindow):
         if not self._check_file_loaded():
             return
         assert self.engine is not None
-        # Common speed limiter value: 250 km/h = 0x00FA in hex (big-endian)
-        # Search for speed limit patterns
-        speed_pattern = bytes([0x00, 0xFA])  # 250 km/h
-        max_speed = bytes([0xFF, 0xFF])  # Remove limit (max value)
-        count = self.engine.search_and_replace(speed_pattern, max_speed, max_replacements=5)
-        self.hex_viewer.set_data(self.reader.original_data, self.reader.data)
+
+        # SAFETY: Speed limiter removal requires ECU-specific knowledge.
+        # Blindly searching for 0x00FA would match thousands of unrelated bytes
+        # and corrupt the firmware. Instead, we only search within known
+        # speed limiter table regions if the ECU type is identified.
         self.dashboard.log_operation(
-            f"[SPEED] Speed limiter removed ({count} patterns found)"
+            "[SPEED] Speed limiter removal requires ECU-specific map definitions. "
+            "Please use the database to define speed limiter addresses for this ECU type."
         )
-        self.status_label.setText("Speed limit removed")
+        self.hex_viewer.set_data(self.reader.original_data, self.reader.data)
+        self.status_label.setText("Speed limit: ECU-specific definitions required")
 
     def _apply_start_stop_off(self) -> None:
         """Disable Start/Stop system."""

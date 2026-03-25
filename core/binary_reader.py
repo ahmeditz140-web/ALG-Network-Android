@@ -38,12 +38,28 @@ class BinaryReader:
         if not self.data:
             raise ValueError("No data loaded to save.")
 
+        # CRITICAL SAFETY CHECK: file size must not change
+        if len(self.data) != len(self.original_data):
+            raise RuntimeError(
+                f"SAFETY ERROR: File size changed from {len(self.original_data)} "
+                f"to {len(self.data)} bytes. This would brick the ECU. "
+                f"Save aborted."
+            )
+
         if output_path is None:
             base, ext = os.path.splitext(self.file_path)
             output_path = f"{base}_modified{ext}"
 
         with open(output_path, "wb") as f:
             f.write(self.data)
+
+        # Verify written file size matches
+        written_size = os.path.getsize(output_path)
+        if written_size != len(self.original_data):
+            raise RuntimeError(
+                f"SAFETY ERROR: Written file size ({written_size}) does not match "
+                f"original ({len(self.original_data)}). File may be corrupted."
+            )
 
         return output_path
 
