@@ -84,16 +84,34 @@ class ProcessingEngine:
 
         return False
 
-    def remove_dtc_by_pattern(self, dtc_hex: bytes) -> int:
+    def remove_dtc_by_pattern(
+        self,
+        dtc_hex: bytes,
+        dtc_table_start: int = -1,
+        dtc_table_end: int = -1,
+    ) -> int:
         """
         Remove DTC by searching for its hex pattern in the DTC table.
         Sets the enable flag byte (typically following the DTC ID) to 0x00.
         Returns number of DTCs disabled.
+
+        SAFETY: If dtc_table_start/dtc_table_end are provided, only searches
+        within that region. Otherwise searches the full file but limits
+        modifications and logs warnings.
         """
+        if len(dtc_hex) < 2:
+            raise ValueError("DTC hex pattern must be at least 2 bytes")
+
         count = 0
-        pos = 0
-        while True:
-            idx = self.data.find(dtc_hex, pos)
+        search_start = dtc_table_start if dtc_table_start >= 0 else 0
+        search_end = dtc_table_end if dtc_table_end >= 0 else len(self.data)
+
+        # Safety: track how many matches we find to warn about excessive matches
+        max_safe_modifications = 50
+        pos = search_start
+
+        while pos < search_end:
+            idx = self.data.find(dtc_hex, pos, search_end)
             if idx == -1:
                 break
 
@@ -111,6 +129,15 @@ class ProcessingEngine:
                         "modified_flag": 0x00,
                     })
                     count += 1
+
+                    # Safety limit to prevent mass corruption
+                    if count >= max_safe_modifications:
+                        self.operations_log.append({
+                            "type": "warning",
+                            "message": f"DTC removal stopped at {count} matches (safety limit). "
+                                       f"Pattern may be too common.",
+                        })
+                        break
 
             pos = idx + len(dtc_hex)
 
@@ -160,11 +187,20 @@ class ProcessingEngine:
         max_value: maximum allowed value (safety limit)
         Returns number of values modified.
         """
+        if value_size not in (1, 2):
+            raise ValueError(f"value_size must be 1 or 2, got {value_size}")
+        if multiplier <= 0:
+            raise ValueError(f"multiplier must be positive, got {multiplier}")
         if max_value is None:
             max_value = (2 ** (value_size * 8)) - 1
 
+        # Calculate safe end boundary aligned to value_size
+        data_end = min(map_start + map_length, len(self.data))
+        # Ensure we don't read past the data boundary
+        safe_end = data_end - (value_size - 1)
+
         count = 0
-        for offset in range(map_start, min(map_start + map_length, len(self.data)), value_size):
+        for offset in range(map_start, safe_end, value_size):
             if value_size == 1:
                 original = self.data[offset]
                 new_val = int(original * multiplier)
@@ -199,11 +235,17 @@ class ProcessingEngine:
         Apply an additive offset to a map/table.
         Used for injection timing adjustments, etc.
         """
+        if value_size not in (1, 2):
+            raise ValueError(f"value_size must be 1 or 2, got {value_size}")
         if max_value is None:
             max_value = (2 ** (value_size * 8)) - 1
 
+        # Calculate safe end boundary aligned to value_size
+        data_end = min(map_start + map_length, len(self.data))
+        safe_end = data_end - (value_size - 1)
+
         count = 0
-        for offset in range(map_start, min(map_start + map_length, len(self.data)), value_size):
+        for offset in range(map_start, safe_end, value_size):
             if value_size == 1:
                 original = self.data[offset]
                 new_val = original + offset_value
